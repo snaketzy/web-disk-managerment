@@ -1,0 +1,31 @@
+services:
+  openlist:
+    image: openlistteam/openlist:latest
+    container_name: web-disk-openlist
+    restart: unless-stopped
+    environment:
+      PUID: 0
+      PGID: 0
+      UMASK: "022"
+    volumes:
+      - openlist-data:/opt/openlist/data
+    ports:
+      - "5244:5244"
+
+  web-disk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: web-disk-manager
+    restart: unless-stopped
+    depends_on:
+      - openlist
+    environment:
+      OPENLIST_URL: http://openlist:5244
+      OPENLIST_TOKEN: ${OPENLIST_TOKEN:-}
+      PORT: 3001
+    ports:
+      - "3001:3001"
+
+volumes:
+  openlist-data:
