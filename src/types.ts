@@ -40,6 +40,14 @@ export interface OpResult {
   message: string
 }
 
+/** 123 秒传（远程源文件）的后台任务状态 */
+export interface ReuseJob {
+  state: 'running' | 'done' | 'error'
+  progress: number
+  message: string
+  result: { reuse: boolean; fileId?: number; message?: string } | null
+}
+
 export interface StorageRecord {
   id: number
   mount_path: string

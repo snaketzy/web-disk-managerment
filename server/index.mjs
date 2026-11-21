@@ -3,6 +3,7 @@ import express from 'express'
 import multer from 'multer'
 import path from 'node:path'
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -72,6 +73,14 @@ async function olPostQuery(pathname, query = {}) {
 }
 
 const joinPath = (dir, name) => `${String(dir).replace(/\/+$/, '')}/${name}` || '/'
+
+const parentDir = (p) => {
+  const parts = String(p || '').replace(/\/+$/, '').split('/')
+  parts.pop()
+  return parts.join('/') || '/'
+}
+
+const baseName = (p) => String(p || '').replace(/\/+$/, '').split('/').pop() || ''
 
 function fail(res, e, code = 502) {
   res.status(code).json({ code, message: String(e?.message || e) })
@@ -309,6 +318,239 @@ app.post('/api/task/:kind/:action', async (req, res) => {
     const { status, json } = await olPostQuery(`/api/task/${kind}/${action}`, req.query)
     res.status(status).json(json)
   } catch (e) { fail(res, e) }
+})
+
+// ---- 123 云盘「秒传」（按 MD5 复用，绕过 10GB 单文件上限） -------------------
+// 秒传原理：123 开放平台 create 接口带 etag(md5) 调用，若服务端已存在同 md5 的文件
+// 则返回 reuse=true，只加引用、不传字节，因此不受「新上传文件」的 10GB 大小限制。
+// 限制：etag 只接受 MD5（sha1 会返回 The Etag value is invalid）。
+
+const PAN123_BASE = 'https://open-api.123pan.com'
+const PAN123_HEADERS = () => ({ 'Content-Type': 'application/json', Platform: 'open_platform' })
+
+async function pan123Token(clientId, clientSecret) {
+  const res = await fetch(`${PAN123_BASE}/api/v1/access_token`, {
+    method: 'POST',
+    headers: PAN123_HEADERS(),
+    body: JSON.stringify({ clientID: clientId, clientSecret: clientSecret }),
+  })
+  const json = await parseJson(res)
+  if (json.code !== 0 || !json.data?.accessToken) throw new Error(json.message || '获取 123 访问令牌失败')
+  return json.data.accessToken
+}
+
+async function pan123List(token, parentId) {
+  const query = new URLSearchParams({
+    parentFileId: String(parentId),
+    limit: '100',
+    page: '1',
+    orderBy: 'filename',
+    orderDirection: 'asc',
+  })
+  const res = await fetch(`${PAN123_BASE}/api/v1/file/list?${query}`, {
+    headers: { Platform: 'open_platform', Authorization: `Bearer ${token}` },
+  })
+  const json = await parseJson(res)
+  if (json.code !== 0) throw new Error(json.message || '列出 123 目录失败')
+  return json.data?.fileList || []
+}
+
+// 把挂载下的相对路径逐级解析成 123 的目录 fileID（根为 0）
+async function pan123ResolveParent(token, segments) {
+  let pid = 0
+  for (const seg of segments) {
+    const list = await pan123List(token, pid)
+    const hit = list.find((i) => i.filename === seg && i.type === 1)
+    if (!hit) throw new Error(`123 上找不到目录：${seg}`)
+    pid = hit.fileID ?? hit.fileId
+  }
+  return pid
+}
+
+async function reuseToPan123({ dstMount, dstDir, filename, size, md5 }) {
+  const { json } = await olGetJson('/api/admin/storage/list')
+  const rec = (json.data?.content || []).find((s) => s.mount_path === dstMount)
+  if (!rec) throw new Error(`目标挂载不存在：${dstMount}`)
+  if (rec.driver !== '123 Open') throw new Error(`目标挂载不是「123 开放平台」驱动（当前：${rec.driver}）`)
+  let addition = {}
+  try {
+    addition = JSON.parse(rec.addition || '{}')
+  } catch {
+    /* ignore */
+  }
+  const { ClientID, ClientSecret } = addition
+  if (!ClientID || !ClientSecret) throw new Error('目标 123 挂载缺少 ClientID / ClientSecret')
+
+  const token = await pan123Token(ClientID, ClientSecret)
+  const mountSegs = dstMount.split('/').filter(Boolean)
+  const allSegs = String(dstDir || '/').split('/').filter(Boolean)
+  const parentId = await pan123ResolveParent(token, allSegs.slice(mountSegs.length))
+
+  const res = await fetch(`${PAN123_BASE}/upload/v1/file/create`, {
+    method: 'POST',
+    headers: { ...PAN123_HEADERS(), Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ parentFileId: parentId, filename, etag: md5, size: Number(size) }),
+  })
+  const out = await parseJson(res)
+  if (out.code !== 0) throw new Error(out.message || '123 秒传请求失败')
+  if (!out.data?.reuse) return { reuse: false, message: '123 上不存在该文件，无法秒传（普通上传会超 10GB 上限）' }
+
+  // 秒传绕过了 OpenList，直接在 123 上建了文件；OpenList 会缓存目录列表，
+  // 这里主动 refresh 一次，否则前端刷新时仍拿到旧（看起来是空）的列表
+  try {
+    await olJson('/api/fs/list', { path: dstDir || '/', page: 1, per_page: 0, refresh: true })
+  } catch {
+    /* 刷新缓存失败不影响秒传结果 */
+  }
+  return { reuse: true, fileId: out.data.fileId ?? out.data.fileID }
+}
+
+// 远程源文件：无现成 md5 时，经 OpenList 流式下载并边读边算 md5（不落盘）
+async function md5OfRemoteFile(filePath, onProgress) {
+  const { json } = await olJson('/api/fs/get', { path: filePath })
+  if (json.code !== 200) throw new Error(json.message || '获取源文件信息失败')
+  const raw = json.data?.raw_url
+  if (!raw) throw new Error('无法获取源文件下载地址')
+  const url = raw.startsWith('/') ? OPENLIST_URL + raw : raw
+  const res = await fetch(url, { headers: authHeaders() })
+  if (!res.ok || !res.body) throw new Error(`下载源文件失败：HTTP ${res.status}`)
+  const hash = crypto.createHash('md5')
+  let read = 0
+  for await (const chunk of res.body) {
+    hash.update(chunk)
+    read += chunk.length
+    onProgress?.(read)
+  }
+  return hash.digest('hex')
+}
+
+const reuseJobs = new Map()
+
+app.post('/api/reuse/local', async (req, res) => {
+  const { dstMount, dstDir, filename, size, md5 } = req.body || {}
+  if (!dstMount || !filename || !size || !md5) return fail(res, new Error('参数不完整'), 400)
+  try {
+    const out = await reuseToPan123({ dstMount, dstDir, filename, size, md5 })
+    res.json({ code: out.reuse ? 200 : 409, message: out.reuse ? '秒传成功' : out.message })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+
+async function runRemoteReuse(job, { srcPath, dstMount, dstDir }) {
+  const dir = parentDir(srcPath)
+  const name = baseName(srcPath)
+  const { json } = await olJson('/api/fs/list', { path: dir, page: 1, per_page: 0, refresh: false })
+  const item = (json.data?.content || []).find((i) => i.name === name)
+  if (!item) throw new Error('源文件不存在')
+  if (item.is_dir) throw new Error('暂不支持目录秒传，请选择单个文件')
+
+  const size = item.size
+  let md5 = item.hash_info?.md5 || item.hashinfo?.md5 || ''
+  if (!md5) {
+    job.message = '读取源文件计算 MD5…'
+    md5 = await md5OfRemoteFile(srcPath, (read) => {
+      job.progress = size ? Math.min(0.99, read / size) : 0
+    })
+  }
+  job.message = '提交 123 秒传…'
+  const out = await reuseToPan123({ dstMount, dstDir, filename: name, size, md5 })
+  job.result = out
+  job.progress = 1
+  job.state = 'done'
+  job.message = out.reuse ? '秒传成功' : out.message
+}
+
+app.post('/api/reuse/remote', async (req, res) => {
+  const { srcPath, dstMount, dstDir } = req.body || {}
+  if (!srcPath || !dstMount) return fail(res, new Error('参数不完整'), 400)
+  const jobId = crypto.randomUUID()
+  const job = { state: 'running', progress: 0, message: '准备中…', result: null }
+  reuseJobs.set(jobId, job)
+  runRemoteReuse(job, { srcPath, dstMount, dstDir: dstDir || '/' }).catch((e) => {
+    job.state = 'error'
+    job.message = String(e?.message || e)
+  })
+  res.json({ code: 200, message: 'success', data: { jobId } })
+})
+
+app.get('/api/reuse/remote/:id', (req, res) => {
+  const job = reuseJobs.get(req.params.id)
+  if (!job) return fail(res, new Error('任务不存在或已过期'), 404)
+  res.json({ code: 200, message: 'success', data: job })
+})
+
+// ---- 123 云盘「生成直链」 --------------------------------------------------
+// 把挂载内的文件路径解析成 123 的 fileID，再调开放平台 /api/v1/direct-link/url。
+// 前提：账号已开通直链空间（VIP），且该文件夹已在 123 官网启用直链空间。
+
+// 找到路径所属的 123 挂载，并取出其客户端密钥（取匹配到的最长挂载路径）
+async function pan123CredsForPath(filePath) {
+  const { json } = await olGetJson('/api/admin/storage/list')
+  const records = (json.data?.content || []).filter(
+    (s) => s.driver === '123 Open' && typeof s.mount_path === 'string' && s.mount_path.startsWith('/'),
+  )
+  const norm = (p) => String(p).replace(/\/+$/, '') || '/'
+  const rec = records
+    .filter((s) => {
+      const m = norm(s.mount_path)
+      return filePath === m || (m !== '/' && filePath.startsWith(m + '/'))
+    })
+    .sort((a, b) => norm(b.mount_path).length - norm(a.mount_path).length)[0]
+  if (!rec) throw new Error('该路径不在任何「123 开放平台」挂载下')
+
+  let addition = {}
+  try {
+    addition = JSON.parse(rec.addition || '{}')
+  } catch {
+    /* ignore */
+  }
+  const { ClientID, ClientSecret } = addition
+  if (!ClientID || !ClientSecret) throw new Error('该 123 挂载缺少 ClientID / ClientSecret')
+  return { mount: rec.mount_path, ClientID, ClientSecret }
+}
+
+// 逐级解析出文件在其父目录下的 fileID
+async function pan123FileId(token, segments) {
+  if (!segments.length) throw new Error('请选择文件')
+  const name = segments[segments.length - 1]
+  const parentId = await pan123ResolveParent(token, segments.slice(0, -1))
+  const list = await pan123List(token, parentId)
+  const hit = list.find((i) => i.filename === name)
+  if (!hit) throw new Error(`123 上找不到文件：${name}`)
+  if (hit.type === 1) throw new Error('目录不支持生成直链')
+  return hit.fileID ?? hit.fileId
+}
+
+async function pan123DirectLink(filePath) {
+  const { mount, ClientID, ClientSecret } = await pan123CredsForPath(filePath)
+  const mountSegs = mount.split('/').filter(Boolean)
+  const allSegs = String(filePath).split('/').filter(Boolean)
+  const token = await pan123Token(ClientID, ClientSecret)
+  const fileId = await pan123FileId(token, allSegs.slice(mountSegs.length))
+  const res = await fetch(`${PAN123_BASE}/api/v1/direct-link/url?fileID=${fileId}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      Platform: 'open_platform',
+      Authorization: `Bearer ${token}`,
+    },
+  })
+  const out = await parseJson(res)
+  if (out.code !== 0) throw new Error(out.message || '获取 123 直链失败')
+  const url = out.data?.url
+  if (typeof url !== 'string' || !url) throw new Error('123 未返回有效直链')
+  return url
+}
+
+app.get('/api/pan123/direct-link', async (req, res) => {
+  const filePath = String(req.query.path || '')
+  if (!filePath) return fail(res, new Error('path required'), 400)
+  try {
+    const url = await pan123DirectLink(filePath)
+    res.json({ code: 200, message: 'success', data: { url } })
+  } catch (e) {
+    fail(res, e)
+  }
 })
 
 // ---- 生产环境托管前端静态资源 --------------------------------------------

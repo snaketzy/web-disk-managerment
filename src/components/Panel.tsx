@@ -3,8 +3,10 @@ import type { MouseEvent as ReactMouseEvent } from 'react'
 import { useAppDispatch, useAppSelector } from '../app/hooks'
 import { navigate, select, setActive, setStorage, toggleHidden } from '../features/panels/panelsSlice'
 import {
+  useAdminStoragesQuery,
   useCopyMutation,
   useGetStoragesQuery,
+  useLazyGenerateDirectLinkQuery,
   useLazyGetFileQuery,
   useListFilesQuery,
   useMkdirMutation,
@@ -13,10 +15,15 @@ import {
   usePutFileMutation,
   useRemoveMutation,
   useRenameMutation,
+  useReuseLocalMutation,
+  useStartRemoteReuseMutation,
 } from '../features/fs/api'
-import type { FsItem, Side } from '../types'
+import type { FsItem, ReuseJob, Side } from '../types'
 import { usePrompt } from '../ui/PromptDialog'
 import { joinPath, parentPath, relativeSegments, storageRootOf } from '../utils/path'
+import { md5File } from '../utils/md5'
+import ReuseMd5Dialog from './ReuseMd5Dialog'
+import type { ReuseInput } from './ReuseMd5Dialog'
 
 const SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB']
 
@@ -44,6 +51,31 @@ export default function Panel({ side }: { side: Side }) {
   const { data: storagesData } = useGetStoragesQuery()
   const storages = useMemo(() => storagesData?.storages ?? [], [storagesData])
 
+  // 秒传只对「123 开放平台」驱动有效：取各挂载的驱动，判断对侧是否可秒传
+  const { data: adminStoragesData } = useAdminStoragesQuery()
+  const otherMount = storageRootOf(otherPanel.storage)
+  const otherDriver = useMemo(() => {
+    const records = adminStoragesData?.data?.content ?? []
+    if (!records.length) return undefined // 拿不到驱动信息（如未配 token）时不限制
+    return records.find((s) => s.mount_path === otherMount)?.driver
+  }, [adminStoragesData, otherMount])
+  const reuseBlocked = !!otherPanel.storage && !!otherDriver && otherDriver !== '123 Open'
+  const reuseTitle = reuseBlocked
+    ? `对侧挂载「${otherPanel.storage}」不是 123 开放平台（${otherDriver}），无法秒传`
+    : null
+
+  // 直链只对「123 开放平台」驱动有效：判断当前面板所在挂载
+  const selfMount = storageRootOf(panel.storage)
+  const selfDriver = useMemo(() => {
+    const records = adminStoragesData?.data?.content ?? []
+    if (!records.length) return undefined // 拿不到驱动信息（如未配 token）时不限制
+    return records.find((s) => s.mount_path === selfMount)?.driver
+  }, [adminStoragesData, selfMount])
+  const linkBlocked = !!panel.storage && !!selfDriver && selfDriver !== '123 Open'
+  const linkTitle = linkBlocked
+    ? `当前挂载「${panel.storage}」不是 123 开放平台（${selfDriver}），无法生成直链`
+    : null
+
   const listQuery = useListFilesQuery({ path: panel.path || '/' }, { skip: !panel.storage })
   const items = useMemo(() => {
     const content = listQuery.data?.data?.content ?? []
@@ -60,10 +92,17 @@ export default function Panel({ side }: { side: Side }) {
   const [newFile] = useNewFileMutation()
   const [putFile] = usePutFileMutation()
   const [fetchFile] = useLazyGetFileQuery()
+  const [reuseLocal] = useReuseLocalMutation()
+  const [startRemoteReuse] = useStartRemoteReuseMutation()
+  const [fetchDirectLink] = useLazyGenerateDirectLinkQuery()
 
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const reuseLocalRef = useRef<HTMLInputElement>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [reuseMsg, setReuseMsg] = useState<string | null>(null)
+  const [reuseMdOpen, setReuseMdOpen] = useState(false)
+  const [linkDialog, setLinkDialog] = useState<{ url: string; copied: boolean } | null>(null)
 
   const selectedSet = useMemo(() => new Set(panel.selected), [panel.selected])
   const selectedNames = panel.selected
@@ -92,6 +131,36 @@ export default function Panel({ side }: { side: Side }) {
 
   const goUp = () => {
     if (canGoUp) dispatch(navigate({ side, path: parentPath(panel.path) }))
+  }
+
+  // 生成直链：仅对选中的单个文件有效
+  const selectedFile = selectedNames.length === 1 ? items.find((i) => i.name === selectedNames[0]) : undefined
+  const canGenLink = !!selectedFile && !selectedFile.is_dir
+
+  const copyLink = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setLinkDialog((d) => (d ? { ...d, copied: true } : d))
+    } catch {
+      setLinkDialog((d) => (d ? { ...d, copied: false } : d))
+    }
+  }
+
+  const doGenerateLink = async () => {
+    if (!selectedFile || selectedFile.is_dir) return
+    setError(null)
+    try {
+      const res = await fetchDirectLink(joinPath(panel.path, selectedFile.name)).unwrap()
+      const url = typeof res === 'object' ? res?.data?.url : undefined
+      if (!url) {
+        setError('后端未返回直链，请先重启后端使新接口生效')
+        return
+      }
+      setLinkDialog({ url, copied: false })
+      void copyLink(url)
+    } catch (e) {
+      setError((e as { data?: { message?: string } })?.data?.message || '生成直链失败')
+    }
   }
 
   const doMkdir = async () => {
@@ -162,6 +231,123 @@ export default function Panel({ side }: { side: Side }) {
       }
     } finally {
       setBusy(false)
+    }
+  }
+
+  const flashReuse = (msg: string) => {
+    setReuseMsg(msg)
+    setTimeout(() => setReuseMsg(null), 4000)
+  }
+
+  // 本地文件秒传：浏览器算 MD5，只把 hash 发给后端调 123
+  const doReuseLocal = async (files: FileList) => {
+    const file = files[0]
+    if (!file) return
+    if (!otherPanel.storage) {
+      setError('对侧面板未选择存储')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    setReuseMsg('计算 MD5… 0%')
+    try {
+      const md5 = await md5File(file, (r) => setReuseMsg(`计算 MD5… ${Math.round(r * 100)}%`))
+      setReuseMsg('提交秒传…')
+      const res = await reuseLocal({
+        dstMount: '/' + otherPanel.storage,
+        dstDir: otherPanel.path,
+        filename: file.name,
+        size: file.size,
+        md5,
+      })
+      if ('error' in res)
+        setError((res.error as { data?: { message?: string } })?.data?.message || '秒传请求失败')
+      else if (res.data?.code === 200) flashReuse(`秒传成功：${file.name}`)
+      else setError(res.data?.message || '秒传失败')
+    } catch {
+      setError('计算 MD5 失败')
+    } finally {
+      setBusy(false)
+      setReuseMsg(null)
+    }
+  }
+
+  // 粘贴/载入 MD5 秒传：文件名 + 大小 + MD5 由弹窗给出
+  const doReuseByMd5 = async (v: ReuseInput) => {
+    setReuseMdOpen(false)
+    if (!otherPanel.storage) {
+      setError('对侧面板未选择存储')
+      return
+    }
+    setError(null)
+    setReuseMsg(`秒传 ${v.filename}…`)
+    try {
+      const res = await reuseLocal({
+        dstMount: '/' + otherPanel.storage,
+        dstDir: otherPanel.path,
+        filename: v.filename,
+        size: v.size,
+        md5: v.md5,
+      })
+      if ('error' in res)
+        setError((res.error as { data?: { message?: string } })?.data?.message || '秒传请求失败')
+      else if (res.data?.code === 200) flashReuse(`秒传成功：${v.filename}`)
+      else setError(res.data?.message || '秒传失败')
+    } finally {
+      setReuseMsg(null)
+    }
+  }
+
+  // 面板内远程文件秒传：后端读源文件算 MD5，前端轮询进度
+  const doReuseSelected = async () => {
+    if (!selectedNames.length) return
+    if (!otherPanel.storage) {
+      setError('对侧面板未选择存储')
+      return
+    }
+    const picked = items.filter((i) => selectedNames.includes(i.name) && !i.is_dir)
+    if (!picked.length) {
+      setError('请选择文件（秒传暂不支持目录）')
+      return
+    }
+    setError(null)
+    try {
+      for (const item of picked) {
+        setReuseMsg(`秒传 ${item.name}…`)
+        const started = await startRemoteReuse({
+          srcPath: joinPath(panel.path, item.name),
+          dstMount: '/' + otherPanel.storage,
+          dstDir: otherPanel.path,
+        })
+        const jobId = 'data' in started ? started.data?.data?.jobId : undefined
+        if (!jobId) {
+          setError(`${item.name}：启动秒传失败`)
+          continue
+        }
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 1200))
+          const j = await fetch(`/api/reuse/remote/${jobId}`)
+            .then((r) => r.json())
+            .catch(() => null)
+          const job = j?.data as ReuseJob | undefined
+          if (!job) {
+            setError(`${item.name}：秒传状态获取失败`)
+            break
+          }
+          if (job.state === 'done') {
+            if (job.result?.reuse) flashReuse(`${item.name}：秒传成功`)
+            else setError(`${item.name}：${job.result?.message || '未命中'}`)
+            break
+          }
+          if (job.state === 'error') {
+            setError(`${item.name}：${job.message}`)
+            break
+          }
+          setReuseMsg(`秒传 ${item.name}… ${Math.round((job.progress || 0) * 100)}%`)
+        }
+      }
+    } finally {
+      setReuseMsg(null)
     }
   }
 
@@ -299,6 +485,22 @@ export default function Panel({ side }: { side: Side }) {
         <button className="ico" title="上传文件" onClick={() => fileInputRef.current?.click()}>
           上传
         </button>
+        <button
+          className="ico"
+          title={reuseTitle || '秒传本地文件到对侧 123（按 MD5 复用，不受 10GB 限制）'}
+          disabled={!otherPanel.storage || reuseBlocked}
+          onClick={() => reuseLocalRef.current?.click()}
+        >
+          秒传文件
+        </button>
+        <button
+          className="ico"
+          title={linkTitle || '获取选中文件的 123 直链（需账号已开通直链空间）'}
+          disabled={!canGenLink || linkBlocked}
+          onClick={() => void doGenerateLink()}
+        >
+          生成直链
+        </button>
         <button className="ico" title="重命名 (F2)" disabled={selectedNames.length !== 1} onClick={() => void doRename()}>
           重命名
         </button>
@@ -319,6 +521,15 @@ export default function Panel({ side }: { side: Side }) {
           style={{ display: 'none' }}
           onChange={(e) => {
             if (e.target.files) void doUpload(e.target.files)
+            e.target.value = ''
+          }}
+        />
+        <input
+          ref={reuseLocalRef}
+          type="file"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            if (e.target.files) void doReuseLocal(e.target.files)
             e.target.value = ''
           }}
         />
@@ -376,6 +587,22 @@ export default function Panel({ side }: { side: Side }) {
         <span className="footer-spacer" />
         <button
           className="ico"
+          disabled={!otherPanel.storage || reuseBlocked}
+          title={reuseTitle || '粘贴 MD5 / 载入本地文件算 MD5 后秒传到对侧 123'}
+          onClick={() => setReuseMdOpen(true)}
+        >
+          粘贴MD5上传
+        </button>
+        <button
+          className="ico"
+          disabled={!selectedNames.length || !otherPanel.storage || reuseBlocked}
+          title={reuseTitle || '秒传到对侧 123（按 MD5 复用，不受 10GB 限制）'}
+          onClick={() => void doReuseSelected()}
+        >
+          秒传 →
+        </button>
+        <button
+          className="ico"
           disabled={!selectedNames.length || !otherPanel.storage}
           title="复制到对侧面板 (F5)"
           onClick={() => void transfer('copy')}
@@ -393,6 +620,42 @@ export default function Panel({ side }: { side: Side }) {
       </div>
 
       {busy && <div className="panel-busy">处理中…</div>}
+      {reuseMsg && <div className="panel-busy">{reuseMsg}</div>}
+      {reuseMdOpen && (
+        <ReuseMd5Dialog onClose={() => setReuseMdOpen(false)} onConfirm={(v) => void doReuseByMd5(v)} />
+      )}
+      {linkDialog && (
+        <div className="modal-overlay" onMouseDown={() => setLinkDialog(null)}>
+          <div className="modal modal-wide" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modal-title">文件直链</div>
+            <label className="modal-label">
+              {linkDialog.copied ? '已复制到剪贴板' : '直链如下（点击「复制」或选中后手动复制）'}
+            </label>
+            <div className="modal-input-row">
+              <input
+                className="modal-input"
+                readOnly
+                value={linkDialog.url}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <button className="btn btn-primary" onClick={() => void copyLink(linkDialog.url)}>
+                复制
+              </button>
+            </div>
+            <div className="modal-hint">
+              直链默认为公开资源，请勿用于图床 / 软件分发等场景；有效期由 123 侧控制。
+            </div>
+            <div className="modal-actions">
+              <button className="btn" onClick={() => window.open(linkDialog.url, '_blank')}>
+                打开
+              </button>
+              <button className="btn btn-primary" onClick={() => setLinkDialog(null)}>
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {error && (
         <div className="panel-error" onClick={() => setError(null)}>
           {error}

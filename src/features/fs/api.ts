@@ -4,6 +4,7 @@ import type {
   FsGetResponse,
   FsListResponse,
   OpResult,
+  ReuseJob,
   StorageItem,
   StorageRecord,
   TaskInfo,
@@ -49,6 +50,18 @@ interface TaskListResponse {
   code: number
   message: string
   data?: TaskInfo[]
+}
+
+interface SimpleResponse {
+  code: number
+  message: string
+  data?: unknown
+}
+
+interface DirectLinkResponse {
+  code: number
+  message: string
+  data?: { url: string }
 }
 
 export const api = createApi({
@@ -148,6 +161,32 @@ export const api = createApi({
       query: ({ uid, time, sign }) => ({ url: 'auth/115/status', params: { uid, time, sign } }),
     }),
 
+    // ---- 123 云盘「秒传」（按 MD5 复用，绕过 10GB 单文件上限） ----
+    // 本地文件：前端算好 md5 直接提交
+    reuseLocal: builder.mutation<
+      SimpleResponse,
+      { dstMount: string; dstDir: string; filename: string; size: number; md5: string }
+    >({
+      query: (body) => ({ url: 'reuse/local', method: 'POST', body }),
+      invalidatesTags: ['List'],
+    }),
+    // 远程文件：后端读源文件算 md5，返回 jobId 供轮询
+    startRemoteReuse: builder.mutation<
+      { code: number; message: string; data?: { jobId: string } },
+      { srcPath: string; dstMount: string; dstDir: string }
+    >({
+      query: (body) => ({ url: 'reuse/remote', method: 'POST', body }),
+    }),
+    getReuseJob: builder.query<{ code: number; message: string; data?: ReuseJob }, string>({
+      query: (id) => `reuse/remote/${id}`,
+    }),
+
+    // ---- 123 云盘「生成直链」 ----
+    // 后端按路径解析出 fileID 后调 123 开放平台取 CDN 直链
+    generateDirectLink: builder.query<DirectLinkResponse, string>({
+      query: (path) => ({ url: 'pan123/direct-link', params: { path } }),
+    }),
+
     // ---- 传输任务 ----
     // 复制/移动在 OpenList 侧是异步任务，进度需轮询任务列表获取
     taskUndone: builder.query<TaskListResponse, TaskKind>({
@@ -187,6 +226,11 @@ export const {
   useToggleStorageMutation,
   useAuth115QrcodeQuery,
   useLazyAuth115StatusQuery,
+  useReuseLocalMutation,
+  useStartRemoteReuseMutation,
+  useGetReuseJobQuery,
+  useLazyGetReuseJobQuery,
+  useLazyGenerateDirectLinkQuery,
   useTaskUndoneQuery,
   useCancelTaskMutation,
   useRetryTaskMutation,

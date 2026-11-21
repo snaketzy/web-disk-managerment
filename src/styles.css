@@ -399,6 +399,32 @@ body {
   border-color: var(--accent);
 }
 
+.modal-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.modal-input-row .modal-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-input-row .btn {
+  white-space: nowrap;
+}
+
+.modal-label-space {
+  margin-top: 10px;
+}
+
+.modal-hint {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 8px;
+  white-space: pre-wrap;
+}
+
 .modal-message {
   color: var(--text);
   font-size: 13px;
@@ -416,6 +442,11 @@ body {
 
 .qr-modal {
   width: 320px;
+}
+
+.modal-wide {
+  width: 520px;
+  max-width: calc(100vw - 32px);
 }
 
 .qr-body {
